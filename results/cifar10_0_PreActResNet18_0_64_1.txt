@@ -1,0 +1,427 @@
+import argparse
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+import torch.optim as optim
+from torchvision import datasets, transforms
+from torch.autograd import Variable
+from torch.utils.data.sampler import SubsetRandomSampler
+
+import os
+from itertools import count
+import time
+import random
+import numpy as np
+
+from models.models import *
+from models.preact_resnet import *
+
+from torchvision.utils import save_image
+
+if not torch.cuda.is_available():
+    print('cuda is required but cuda is not available')
+    exit()
+
+#== parser start
+parser = argparse.ArgumentParser(description='PyTorch')
+# base setting 1: fixed
+parser.add_argument('--job-id', type=int, default=1)
+parser.add_argument('--seed', type=int, default=None)
+# base setting 2: fixed
+parser.add_argument('--test-batch-size', type=int, default=100)
+parser.add_argument('--momentum', type=float, default=0.9)
+parser.add_argument('--weight-decay', type=float, default=1e-4)
+parser.add_argument('--data-path', type=str, default='./dataset/')                    
+# experiment setting
+parser.add_argument('--dataset', type=str, default='mnist') 
+parser.add_argument('--data-aug', type=int, default=0) 
+parser.add_argument('--model', type=str, default='LeNet') 
+# method setting
+parser.add_argument('--lr', type=float, default=0.01)
+parser.add_argument('--batch-size', type=int, default=64)
+parser.add_argument('--ssize', type=int, default=64)
+parser.add_argument('--method', type=int, default=0) 
+                    # --method=0: standard
+                    # --method=1: q-SGD 
+args = parser.parse_args()                    
+#== parser end
+data_path = args.data_path + args.dataset
+if not os.path.isdir(data_path):
+    os.makedirs(data_path)
+
+result_path = './results/'    
+if not os.path.isdir(result_path):
+    os.makedirs(result_path)
+result_path += args.dataset + '_' + str(args.data_aug) + '_' + args.model
+result_path += '_' + str(args.method) + '_' + str(args.batch_size)
+if args.method != 0:
+    result_path += '_' + str(args.ssize) 
+result_path += '_' + str(args.job_id)
+filep = open(result_path + '.txt', 'w')
+with open(__file__) as f: 
+    filep.write('\n'.join(f.read().split('\n')[1:]))
+filep.write('\n\n')    
+
+out_str = str(args)
+print(out_str)
+filep.write(out_str + '\n') 
+
+if args.seed is None:
+  args.seed = random.randint(1, 10000)
+random.seed(args.seed)
+torch.manual_seed(args.seed)
+torch.cuda.manual_seed_all(args.seed)
+torch.backends.cudnn.enabled = True
+
+out_str = 'initial seed = ' + str(args.seed)
+print(out_str)
+filep.write(out_str + '\n\n')
+
+#===============================================================
+#=== dataset setting
+#===============================================================
+kwargs = {}
+train_transform = transforms.Compose([transforms.ToTensor()])
+test_transform = transforms.Compose([transforms.ToTensor()])
+train_Sampler = None
+test_Sampler = None
+Shuffle = True
+if args.dataset == 'mnist':
+    nh = 28
+    nw = 28
+    nc = 1
+    num_class = 10
+    end_epoch = 50
+    if args.data_aug == 1:        
+        end_epoch = 200 
+        train_transform = transforms.Compose([
+                            transforms.RandomCrop(28, padding=2),
+                            transforms.RandomAffine(15, scale=(0.85, 1.15)),
+                            transforms.ToTensor()       
+                       ])                
+    train_data = datasets.MNIST(data_path, train=True, download=True, transform=train_transform)
+    test_data = datasets.MNIST(data_path, train=False, download=True, transform=test_transform)
+elif args.dataset == 'cifar10':
+    nh = 32
+    nw = 32
+    nc = 3
+    num_class = 10 
+    end_epoch = 50
+    if args.data_aug == 1:
+        end_epoch = 200 
+        train_transform = transforms.Compose([
+            transforms.RandomCrop(32, padding=4),
+            transforms.RandomHorizontalFlip(),
+            transforms.ToTensor(),
+            transforms.Normalize((0.4914, 0.4822, 0.4465), (0.2023, 0.1994, 0.2010)),
+        ])
+        test_transform = transforms.Compose([
+            transforms.ToTensor(),
+            transforms.Normalize((0.4914, 0.4822, 0.4465), (0.2023, 0.1994, 0.2010)),
+        ])
+    train_data = datasets.CIFAR10(root=data_path, train=True, download=True, transform=train_transform)
+    test_data = datasets.CIFAR10(root=data_path, train=False, download=True, transform=test_transform)
+elif args.dataset == 'cifar100':
+    nh = 32
+    nw = 32
+    nc = 3
+    num_class = 100
+    end_epoch = 50
+    if args.data_aug == 1:
+        end_epoch = 200    
+        train_transform = transforms.Compose([
+            transforms.RandomCrop(32, padding=4),
+            transforms.RandomHorizontalFlip(),
+            transforms.ToTensor()
+        ])
+        test_transform = transforms.Compose([
+            transforms.ToTensor()
+        ])
+    train_data = datasets.CIFAR100(root=data_path, train=True, download=True, transform=train_transform)
+    test_data = datasets.CIFAR100(root=data_path, train=False, download=True, transform=test_transform)
+elif args.dataset == 'svhn':
+    nh = 32
+    nw = 32
+    nc = 3
+    num_class = 10
+    end_epoch = 50    
+    if args.data_aug == 1:
+        end_epoch = 200
+        train_transform = transforms.Compose([
+            transforms.RandomCrop(32, padding=4),
+            transforms.RandomHorizontalFlip(),
+            transforms.ToTensor()
+        ])
+        test_transform = transforms.Compose([
+            transforms.ToTensor()
+        ])
+    train_data = datasets.SVHN(data_path, split='train', download=True, transform=train_transform)
+    test_data = datasets.SVHN(data_path, split='test', download=True, transform=test_transform)    
+elif args.dataset == 'fashionmnist':
+    nh = 28
+    nw = 28
+    nc = 1
+    num_class = 10
+    end_epoch = 20
+    if args.data_aug == 1:
+        end_epoch = 200       
+        train_transform = transforms.Compose([
+            transforms.RandomCrop(28, padding=2),
+            transforms.RandomHorizontalFlip(),
+            transforms.ToTensor()
+        ]) 
+    train_data = datasets.FashionMNIST(data_path, train=True, download=True, transform=train_transform)
+    test_data = datasets.FashionMNIST(data_path, train=False, download=True, transform=test_transform)
+elif args.dataset == 'kmnist':
+    nh = 28
+    nw = 28
+    nc = 1
+    num_class = 10
+    end_epoch = 50
+    if args.data_aug == 1:
+        end_epoch = 200
+        train_transform = transforms.Compose([
+                            transforms.RandomCrop(28, padding=2),
+                            transforms.ToTensor()       
+                       ])
+    train_data = datasets.KMNIST(data_path, train=True, download=True, transform=train_transform)
+    test_data = datasets.KMNIST(data_path, train=False, download=True, transform=test_transform)
+elif args.dataset == 'semeion':
+    nh = 16
+    nw = 16
+    nc = 1
+    num_class = 10 # the digits from 0 to 9 (written by 80 people twice)    
+    end_epoch = 50
+    if args.data_aug == 1:
+        end_epoch = 200
+        train_transform = transforms.Compose([
+            transforms.RandomCrop(16, padding=1),
+            transforms.RandomAffine(4, scale=(1.05, 1.05)),
+            transforms.ToTensor()
+        ])
+        test_transform = transforms.Compose([
+            transforms.ToTensor()
+        ])    
+    train_data = datasets.SEMEION(data_path, transform=train_transform, download=True) 
+    test_data = train_data    
+    random_index = np.load(data_path+'/random_index.npy')
+    train_size = 1000    
+    train_Sampler = SubsetRandomSampler(random_index[range(train_size)])
+    test_Sampler = SubsetRandomSampler(random_index[range(train_size,len(test_data))])
+    Shuffle = False
+elif args.dataset == 'fakedata':
+    nh = 24
+    nw = 24
+    nc = 3
+    num_class = 10  
+    end_epoch = 50   
+    train_size = 1000
+    test_size = 1000
+    train_data = datasets.FakeData(size=train_size+test_size, image_size=(nc, nh, nw), num_classes=num_class, transform=train_transform)
+    test_data  = train_data 
+    train_Sampler = SubsetRandomSampler(range(train_size))
+    test_Sampler = SubsetRandomSampler(range(train_size,len(test_data)))
+    Shuffle = False    
+else: 
+    print('specify dataset')
+    exit()   
+train_loader = torch.utils.data.DataLoader(train_data, batch_size=args.batch_size,      sampler=train_Sampler, shuffle=Shuffle, **kwargs)
+test_loader  = torch.utils.data.DataLoader(test_data,  batch_size=args.test_batch_size, sampler=test_Sampler,  shuffle=False,   **kwargs)
+
+#===============================================================
+#=== model setting
+#===============================================================
+if args.model == 'LeNet':
+    model = LeNet(nc, nh, nw, num_class).cuda()
+elif args.model == 'PreActResNet18':
+    model = PreActResNet18(nc, num_class).cuda()
+elif args.model == 'Linear' or args.model == 'SVM':
+    dx = nh * nw * nc     
+    model = Linear(dx, num_class).cuda()
+else:
+    print('specify model')
+    exit() 
+    
+#===============================================================
+#=== utils def
+#===============================================================
+def lr_decay_func(optimizer, lr_decay=0.1):
+    for param_group in optimizer.param_groups:
+        param_group['lr'] *= 0.1   
+    return optimizer    
+def lr_scheduler(optimizer, epoch, lr_decay=0.1, interval=10):
+    if args.data_aug == 0:
+        if epoch == 10 or epoch == 50:
+            optimizer = lr_decay_func(optimizer, lr_decay=lr_decay) 
+    if args.data_aug == 1:
+        if epoch == 10 or epoch == 100:
+            optimizer = lr_decay_func(optimizer, lr_decay=lr_decay)                   
+    return optimizer
+
+class multiClassHingeLoss(nn.Module):
+    def __init__(self):
+        super(multiClassHingeLoss, self).__init__()
+    def forward(self, output, y):
+        index = torch.arange(0, y.size()[0]).long().cuda()
+        output_y = output[index, y.data.cuda()].view(-1,1)
+        loss = output - output_y + 1.0 
+        loss[index, y.data.cuda()] = 0
+        loss[loss < 0]=0
+        loss = torch.sum(loss, dim=1) / output.size()[1]
+        return loss 
+hinge_loss = multiClassHingeLoss()
+    
+#===============================================================
+#=== train optimization def
+#===============================================================
+optimizer = optim.SGD(model.parameters(), lr=args.lr, momentum=args.momentum, weight_decay=args.weight_decay)  
+ssize = args.ssize
+def train(epoch):
+    global optimizer, ssize
+    model.train()
+    optimizer = lr_scheduler(optimizer, epoch)  
+    
+    train_acc_prev = pl_result[epoch-1, 0, 1]
+    if train_acc_prev >= 99.5 and ssize > 4:
+        ssize = 4        
+        optimizer = lr_decay_func(optimizer, lr_decay=0.5)
+    elif train_acc_prev >= 95 and ssize > 8:
+        ssize = 8
+    elif train_acc_prev >= 90 and ssize > 16:
+        ssize = 16    
+    elif train_acc_prev >= 80 and ssize > 32:
+        ssize = 32 
+        
+    for batch_idx, (x, y) in enumerate(train_loader):
+        bs = y.size(0) 
+        x = Variable(x.cuda())
+        y = Variable(y.cuda())     
+        h1 = model(x)
+        if args.model == 'SVM':
+            cr_loss = hinge_loss(h1, y)
+        else:        
+            cr_loss = F.cross_entropy(h1, y, reduction='none')
+        if args.method == 0 or ssize >= bs:
+            loss = torch.mean(cr_loss)             
+        elif args.method == 1:                
+            loss = torch.mean(torch.topk(cr_loss, min(ssize, bs), sorted=False, dim=0)[0]) 
+        else:
+            print('specify method')
+            exit()                              
+        optimizer.zero_grad() 
+        loss.backward()        
+        optimizer.step()  
+     
+    optimizer.zero_grad() 
+
+
+#===============================================================
+#=== train/test output def
+#===============================================================    
+def output(data_loader):
+    if data_loader == train_loader:    
+        model.train()
+    elif data_loader == test_loader:
+        model.eval()
+    total_loss = 0    
+    total_correct = 0      
+    total_size = 0   
+    for batch_idx, (x, y) in enumerate(data_loader):
+        x, y = Variable(x.cuda()), Variable(y.cuda())
+        h1 = model(x)
+        y_hat = h1.data.max(1)[1]
+        if args.model == 'SVM':
+            total_loss += torch.mean(hinge_loss(h1, y)).item() * y.size(0)
+        else:                
+            total_loss += F.cross_entropy(h1, y).item() * y.size(0)
+        total_correct += y_hat.eq(y.data).cpu().sum()                
+        total_size += y.size(0)    
+    # print
+    total_loss /= total_size 
+    total_acc = 100. * float(total_correct) / float(total_size)  
+    if data_loader == train_loader:    
+        out_str = 'tr_l={:.3f} tr_a={:.2f}:'.format(total_loss, total_acc) 
+    elif data_loader == test_loader:
+        out_str = 'te_l={:.3f} te_a={:.2f}:'.format(total_loss, total_acc)            
+    print(out_str, end=' ')
+    filep.write(out_str + ' ') 
+    return (total_loss, total_acc)  
+
+#===============================================================
+#=== start computation
+#===============================================================    
+#== for plot
+pl_result = np.zeros((end_epoch+1, 3, 2))  # epoch * (train, test, time) * (loss , acc) 
+#== main loop start
+time_start = time.time()
+for epoch in count(0):
+    out_str = str(epoch)
+    print(out_str, end=' ') 
+    filep.write(out_str + ' ')
+    if epoch >= 1:
+        train(epoch)
+    pl_result[epoch, 0, :] = output(train_loader)
+    pl_result[epoch, 1, :] = output(test_loader)
+    time_current = time.time() - time_start
+    pl_result[epoch, 2, 0] = time_current
+    np.save(result_path + '_' + 'pl', pl_result)    
+    out_str = 'time={:.1f}:'.format(time_current) 
+    print(out_str)    
+    filep.write(out_str + '\n')   
+    if epoch == end_epoch:
+        break
+
+Namespace(job_id=1, seed=None, test_batch_size=100, momentum=0.9, weight_decay=0.0001, data_path='./dataset/', dataset='cifar10', data_aug=0, model='PreActResNet18', lr=0.01, batch_size=64, ssize=64, method=0)
+initial seed = 3026
+
+0 tr_l=2.316 tr_a=9.41: te_l=2.314 te_a=9.85: time=10.1:
+1 tr_l=0.907 tr_a=67.84: te_l=0.929 te_a=67.04: time=33.5:
+2 tr_l=0.591 tr_a=79.49: te_l=0.685 te_a=76.35: time=56.7:
+3 tr_l=0.502 tr_a=82.46: te_l=0.665 te_a=77.38: time=78.6:
+4 tr_l=0.351 tr_a=87.92: te_l=0.552 te_a=81.58: time=102.4:
+5 tr_l=0.265 tr_a=91.01: te_l=0.533 te_a=82.21: time=124.8:
+6 tr_l=0.172 tr_a=94.23: te_l=0.520 te_a=83.75: time=146.2:
+7 tr_l=0.167 tr_a=94.32: te_l=0.619 te_a=81.88: time=170.1:
+8 tr_l=0.097 tr_a=96.71: te_l=0.555 te_a=84.03: time=192.6:
+9 tr_l=0.091 tr_a=96.75: te_l=0.652 te_a=83.31: time=215.3:
+10 tr_l=0.013 tr_a=99.77: te_l=0.534 te_a=86.51: time=239.2:
+11 tr_l=0.012 tr_a=99.80: te_l=0.534 te_a=86.53: time=262.1:
+12 tr_l=0.012 tr_a=99.81: te_l=0.536 te_a=86.65: time=285.6:
+13 tr_l=0.011 tr_a=99.85: te_l=0.540 te_a=86.64: time=308.7:
+14 tr_l=0.010 tr_a=99.88: te_l=0.539 te_a=86.57: time=330.8:
+15 tr_l=0.009 tr_a=99.89: te_l=0.544 te_a=86.61: time=354.1:
+16 tr_l=0.010 tr_a=99.85: te_l=0.547 te_a=86.63: time=376.7:
+17 tr_l=0.009 tr_a=99.89: te_l=0.546 te_a=86.66: time=398.7:
+18 tr_l=0.008 tr_a=99.90: te_l=0.543 te_a=86.60: time=422.2:
+19 tr_l=0.008 tr_a=99.90: te_l=0.554 te_a=86.58: time=444.7:
+20 tr_l=0.008 tr_a=99.91: te_l=0.555 te_a=86.67: time=468.0:
+21 tr_l=0.008 tr_a=99.92: te_l=0.551 te_a=86.72: time=491.8:
+22 tr_l=0.007 tr_a=99.93: te_l=0.556 te_a=86.73: time=513.8:
+23 tr_l=0.007 tr_a=99.93: te_l=0.557 te_a=86.74: time=537.3:
+24 tr_l=0.007 tr_a=99.93: te_l=0.558 te_a=86.70: time=560.7:
+25 tr_l=0.006 tr_a=99.96: te_l=0.559 te_a=86.82: time=582.9:
+26 tr_l=0.006 tr_a=99.96: te_l=0.560 te_a=86.68: time=606.6:
+27 tr_l=0.006 tr_a=99.94: te_l=0.564 te_a=86.86: time=629.7:
+28 tr_l=0.006 tr_a=99.96: te_l=0.565 te_a=86.77: time=652.5:
+29 tr_l=0.006 tr_a=99.95: te_l=0.566 te_a=86.67: time=676.5:
+30 tr_l=0.005 tr_a=99.97: te_l=0.567 te_a=86.84: time=698.9:
+31 tr_l=0.005 tr_a=99.96: te_l=0.574 te_a=86.80: time=723.1:
+32 tr_l=0.005 tr_a=99.96: te_l=0.574 te_a=86.77: time=745.9:
+33 tr_l=0.005 tr_a=99.96: te_l=0.567 te_a=86.78: time=766.8:
+34 tr_l=0.005 tr_a=99.96: te_l=0.567 te_a=86.72: time=791.3:
+35 tr_l=0.005 tr_a=99.97: te_l=0.569 te_a=86.73: time=813.5:
+36 tr_l=0.005 tr_a=99.97: te_l=0.580 te_a=86.85: time=835.9:
+37 tr_l=0.005 tr_a=99.97: te_l=0.576 te_a=86.81: time=858.3:
+38 tr_l=0.004 tr_a=99.97: te_l=0.575 te_a=86.75: time=880.8:
+39 tr_l=0.004 tr_a=99.98: te_l=0.575 te_a=86.65: time=902.8:
+40 tr_l=0.004 tr_a=99.98: te_l=0.581 te_a=86.75: time=927.0:
+41 tr_l=0.004 tr_a=99.97: te_l=0.578 te_a=86.83: time=949.5:
+42 tr_l=0.004 tr_a=99.97: te_l=0.580 te_a=86.84: time=974.3:
+43 tr_l=0.004 tr_a=99.98: te_l=0.580 te_a=86.78: time=999.1:
+44 tr_l=0.004 tr_a=99.98: te_l=0.584 te_a=86.84: time=1022.3:
+45 tr_l=0.004 tr_a=99.99: te_l=0.591 te_a=86.82: time=1047.4:
+46 tr_l=0.004 tr_a=99.97: te_l=0.593 te_a=86.81: time=1070.6:
+47 tr_l=0.003 tr_a=99.98: te_l=0.593 te_a=86.68: time=1094.7:
+48 tr_l=0.004 tr_a=99.98: te_l=0.593 te_a=86.74: time=1119.2:
+49 tr_l=0.003 tr_a=99.99: te_l=0.595 te_a=86.80: time=1141.9:
+50 tr_l=0.003 tr_a=99.97: te_l=0.593 te_a=86.76: time=1164.6:
